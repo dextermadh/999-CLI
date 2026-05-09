@@ -1,0 +1,8 @@
+/.999
+.env
+/999_cli.egg-info
+/__pycache__
+/core/__pycache__
+/ethics/__pycache__
+/gemma_cli.egg-info
+/tools/__pycache__
