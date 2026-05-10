@@ -120,7 +120,11 @@ def _get_display_text(text: str) -> str:
 
 def analyze_node(state: AgentState):
     """Gathers context before planning. Loads project config if available."""
-    map_str = analyzer.map_codebase(max_depth=4)
+    # Only refresh the map if we just performed a write/delete operation
+    last_verification = state.get("verification_result", "")
+    should_refresh = any(phrase in last_verification for phrase in ["Successfully wrote", "Successfully patched", "Successfully deleted", "Successfully moved"])
+    
+    map_str = analyzer.map_codebase(max_depth=4, refresh=should_refresh)
 
     # Load project config (.999/config.md) - truncate to save context
     config_path = os.path.join(workspace_path, ".999", "config.md")
@@ -135,7 +139,7 @@ def analyze_node(state: AgentState):
             pass
 
     analysis_parts = [
-        f"CURRENT DIRECTORY: {state.get('current_dir', os.getcwd())}",
+        f"WORKSPACE: {workspace_path}",
         f"CODEBASE MAP (Depth 4):\n{map_str}"
     ]
     if config_content:
@@ -185,7 +189,9 @@ def plan_node(state: AgentState):
         "search_code": '{"tool": "search_code", "pattern": "string", "file_pattern": "string"}',
         "browse_url": '{"tool": "browse_url", "url": "string"}',
         "index_workspace": '{"tool": "index_workspace"}',
-        "semantic_search": '{"tool": "semantic_search", "query": "string"}'
+        "semantic_search": '{"tool": "semantic_search", "query": "string"}',
+        "get_codebase_summary": '{"tool": "get_codebase_summary"}',
+        "extract_symbols": '{"tool": "extract_symbols", "path": "string"}'
     }
     
     allowed = state.get('allowed_tools', [])
@@ -214,9 +220,10 @@ def plan_node(state: AgentState):
     for m in history:
         content = m.content
         
-        # Truncate large results (like directory lists or file reads)
-        if len(content) > 1500:
-            content = content[:1500] + "... (truncated)"
+        # Truncate extremely large results (like directory lists or full document reads)
+        # 30k chars is safe for most local models and provides plenty of context
+        if len(content) > 30000:
+            content = content[:30000] + "... (truncated for context)"
 
         if m.type == "ai":
             # Strip technical tags to keep the reasoning thread clean
@@ -496,6 +503,10 @@ def execute_node(state: AgentState):
             c.print(f"[dim]📁 Listing {tool_data.get('path') or '.'}...[/dim]")
         elif tool_name == "index_workspace":
             c.print(f"[dim]📦 Indexing workspace...[/dim]")
+        elif tool_name == "get_codebase_summary":
+            c.print(f"[dim]📊 Synthesizing project summary...[/dim]")
+        elif tool_name == "extract_symbols":
+            c.print(f"[dim]🧩 Extracting symbols from {tool_data.get('path')}...[/dim]")
 
         result = _dispatch_tool(tool_data, tool_name, state)
         if result is not None:
@@ -548,7 +559,11 @@ def _dispatch_tool(tool_data: dict, tool_name: str, state: AgentState) -> str:
         elif tool_name == "index_workspace":
             return rag_engine.index_workspace()
         elif tool_name == "semantic_search":
-            return rag_engine.semantic_search(tool_data.get("query", ""), tool_data.get("top_k", 3))
+            return rag_engine.semantic_search(tool_data.get("query", ""), tool_data.get("top_k", 10))
+        elif tool_name == "get_codebase_summary":
+            return analyzer.get_codebase_summary()
+        elif tool_name == "extract_symbols":
+            return analyzer.extract_symbols(tool_data.get("path", ""))
         elif tool_name == "browse_url":
             return web_tools.browse_url(tool_data.get("url"))
         elif tool_name == "fetch_url":

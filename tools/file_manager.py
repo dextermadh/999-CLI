@@ -1,11 +1,24 @@
 import os
 from pathlib import Path
 from typing import List, Union
+from tools.vision_engine import VisionEngine
 
 class LocalFileManager:
     def __init__(self, project_root: str):
         # Resolve to absolute path to prevent ".." directory traversal attacks
         self.root = Path(project_root).resolve()
+        
+        # Initialize Vision Engine with common Tesseract paths
+        tess_path = None
+        possible_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Users\{}\AppData\Local\Tesseract-OCR\tesseract.exe".format(os.getlogin())
+        ]
+        for p in possible_paths:
+            if os.path.exists(p):
+                tess_path = p
+                break
+        self.vision = VisionEngine(tesseract_path=tess_path)
 
     def _is_safe_path(self, path: Union[str, Path]) -> bool:
         """Ensures the agent is not trying to access files outside the project root."""
@@ -56,16 +69,85 @@ class LocalFileManager:
             return [f"Error: {str(e)}"]
 
     def read_file(self, file_path: str) -> str:
-        """Reads content of a local file."""
+        """Reads content of a local file, supporting text, PDF, Word, and Excel."""
         target_file = (self.root / file_path).resolve()
         
         if not self._is_safe_path(target_file):
             return "Error: Access Denied."
             
+        if not target_file.exists():
+            return f"Error: File {file_path} not found."
+
+        ext = target_file.suffix.lower()
+        
         try:
-            return target_file.read_text(encoding="utf-8")
+            if ext in ['.txt', '.py', '.js', '.ts', '.html', '.css', '.md', '.json', '.yaml', '.yml', '.sql', '.sh']:
+                return target_file.read_text(encoding="utf-8")
+            
+            elif ext == '.pdf':
+                from pypdf import PdfReader
+                reader = PdfReader(target_file)
+                text = []
+                for page in reader.pages:
+                    text.append(page.extract_text())
+                
+                # Perform OCR on embedded images
+                ocr_text = self.vision.extract_and_ocr_pdf(target_file)
+                if ocr_text:
+                    text.append("\n[DEEP SCAN: OCR TEXT FROM IMAGES]\n" + ocr_text)
+                
+                return "\n".join(text)
+                
+            elif ext == '.docx':
+                import docx
+                doc = docx.Document(target_file)
+                text = [para.text for para in doc.paragraphs]
+                
+                # Perform OCR on embedded images
+                ocr_text = self.vision.extract_and_ocr_docx(target_file)
+                if ocr_text:
+                    text.append("\n[DEEP SCAN: OCR TEXT FROM IMAGES]\n" + ocr_text)
+                    
+                return "\n".join(text)
+                
+            elif ext in ['.xlsx', '.xls']:
+                import openpyxl
+                if ext == '.xlsx':
+                    wb = openpyxl.load_workbook(target_file, data_only=True)
+                    output = []
+                    for sheet in wb.sheetnames:
+                        output.append(f"Sheet: {sheet}")
+                        ws = wb[sheet]
+                        for row in ws.iter_rows(values_only=True):
+                            output.append("\t".join([str(c) if c is not None else "" for c in row]))
+                    return "\n".join(output)
+                else:
+                    return "Error: .xls (Legacy Excel) requires xlrd. Converting to .xlsx is recommended."
+
+            elif ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+                from PIL import Image
+                with Image.open(target_file) as img:
+                    metadata = f"Image Metadata:\nFormat: {img.format}\nSize: {img.size}\nMode: {img.mode}"
+                    ocr_text = self.vision.ocr_image(img)
+                    if ocr_text:
+                        metadata += f"\n\nOCR TEXT CONTENT:\n{ocr_text}"
+                    return metadata
+
+            elif ext == '.csv':
+                import csv
+                output = []
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        output.append(",".join(row))
+                return "\n".join(output)
+
+            else:
+                # Default to text if unknown
+                return target_file.read_text(encoding="utf-8")
+                
         except Exception as e:
-            return f"Error reading file: {str(e)}"
+            return f"Error reading {ext} file: {str(e)}"
 
     def write_file(self, file_path: str, content: str) -> str:
         """Writes content to a file. Useful for the agent creating code."""

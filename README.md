@@ -18,11 +18,17 @@
 - **Git Checkpoints**: Automatically stashes changes before complex file operations, allowing for instant `/undo`.
 
 ### 🛠️ Integrated Toolset
-- **File Manager**: Precise reading, writing, patching (diff-based), and searching across the codebase.
+- **File Manager**: Precise reading, writing, patching (diff-based), and searching. Now supports **PDF, Word (.docx), Excel (.xlsx), and CSV**.
 - **Terminal**: Execute build commands, install dependencies, and run scripts.
 - **Git Integration**: Full control over status, diffs, commits, and branch management.
-- **Browser & Web**: Capability to fetch documentation or browse local dev servers for verification.
-- **RAG Engine**: Semantic search and workspace indexing for deep architectural understanding.
+- **Browser & Web**: Fetch documentation or browse local dev servers for verification.
+- **RAG Engine**: Semantic search and workspace indexing with **smart chunking** for deep architectural understanding.
+
+### 🆕 Advanced Intelligence Layers
+- **Symbol Intelligence**: AST-based extraction of functions, classes, and methods for instant codebase mapping.
+- **Vision & OCR Intelligence**: Ability to "read" images and extract text from visuals inside PDFs and Word documents (requires Tesseract OCR).
+- **Performance Caching**: Intelligent codebase mapping cache to maintain high speed in massive enterprise repositories.
+- **Automated Synthesis**: New `get_codebase_summary` tool for instant project-level insights and architectural overviews.
 
 ### 🏥 Auto-Heal & Auto-Test
 - **Auto-Test**: Automatically detects and runs `pytest`, `npm test`, or `go test` after modifications.
@@ -51,6 +57,7 @@ graph TD
 ### 1. Prerequisites
 - **Python 3.10+**
 - **LM Studio**: Running the `gemma-4-e4b` model (or compatible) on `http://localhost:1234/v1`.
+- **Tesseract OCR**: Required for image reading and OCR (install from [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki)).
 
 ### 2. Installation
 Clone the repository and install in editable mode:

@@ -7,6 +7,9 @@ class CodeAnalyzer:
     def __init__(self, workspace_root: str):
         self.workspace = Path(workspace_root).resolve()
         self.ignore_dirs = {'.git', '__pycache__', 'venv', 'env', 'node_modules', '.next', '.999', 'dist', 'build'}
+        self._tree_cache = None
+        self._cache_time = 0
+        self._cache_expiry = 300 # 5 minutes
 
     def _get_ignored_patterns(self):
         patterns = list(self.ignore_dirs)
@@ -22,9 +25,17 @@ class CodeAnalyzer:
                 pass
         return set(p for p in patterns if p)
 
-    def map_codebase(self, max_depth: int = 2) -> str:
+    def map_codebase(self, max_depth: int = 2, refresh: bool = False) -> str:
         """Returns a string representation of the directory tree with depth limits."""
-        return self.list_dir_tree(".", max_depth)
+        import time
+        now = time.time()
+        
+        if not refresh and self._tree_cache and (now - self._cache_time < self._cache_expiry):
+            return self._tree_cache
+            
+        self._tree_cache = self.list_dir_tree(".", max_depth)
+        self._cache_time = now
+        return self._tree_cache
 
     def list_dir_tree(self, path: str = ".", max_depth: int = 2) -> str:
         target_dir = (self.workspace / path).resolve()
@@ -137,3 +148,72 @@ class CodeAnalyzer:
             return '\n'.join(result)
         except Exception as e:
             return f"Error reading file lines: {str(e)}"
+
+    def extract_symbols(self, file_path: str) -> str:
+        """Extracts classes, functions, and methods from a file using AST or Regex."""
+        target_file = (self.workspace / file_path).resolve()
+        if not target_file.exists():
+            return f"Error: File {file_path} not found."
+
+        if target_file.suffix == '.py':
+            return self._extract_python_symbols(target_file)
+        else:
+            return self._extract_generic_symbols(target_file)
+
+    def _extract_python_symbols(self, file_path: Path) -> str:
+        import ast
+        try:
+            tree = ast.parse(file_path.read_text(encoding='utf-8'))
+            symbols = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    symbols.append(f"CLASS: {node.name} (Line {node.lineno})")
+                elif isinstance(node, ast.FunctionDef):
+                    symbols.append(f"FUNC: {node.name} (Line {node.lineno})")
+            return "\n".join(symbols) if symbols else "No symbols found."
+        except Exception as e:
+            return f"Error parsing Python AST: {str(e)}"
+
+    def _extract_generic_symbols(self, file_path: Path) -> str:
+        # Fallback for JS/TS/Go/etc.
+        patterns = [
+            r'(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)', # JS/TS Functions
+            r'(?:export\s+)?class\s+([a-zA-Z0-9_]+)',                 # JS/TS Classes
+            r'func\s+([a-zA-Z0-9_]+)',                                # Go Functions
+            r'fn\s+([a-zA-Z0-9_]+)',                                  # Rust Functions
+        ]
+        symbols = []
+        try:
+            content = file_path.read_text(encoding='utf-8')
+            for pattern in patterns:
+                matches = re.finditer(pattern, content)
+                for m in matches:
+                    symbols.append(f"SYMBOL: {m.group(1)}")
+            return "\n".join(set(symbols)) if symbols else "No symbols found."
+        except Exception as e:
+            return f"Error reading file: {str(e)}"
+
+    def get_codebase_summary(self) -> str:
+        """Synthesizes a high-level summary of the entire codebase."""
+        summary = []
+        # 1. README
+        readme_path = self.workspace / "README.md"
+        if readme_path.exists():
+            content = readme_path.read_text(encoding='utf-8')
+            summary.append(f"--- README OVERVIEW ---\n{content[:500]}...")
+        
+        # 2. Structure Overview (Depth 2)
+        summary.append(f"\n--- DIRECTORY STRUCTURE ---\n{self.map_codebase(max_depth=2)}")
+        
+        # 3. Key Files Analysis
+        key_files = ["main.py", "app.py", "index.js", "package.json", "requirements.txt"]
+        key_symbols = []
+        for kf in key_files:
+            if (self.workspace / kf).exists():
+                syms = self.extract_symbols(kf)
+                key_symbols.append(f"Symbols in {kf}:\n{syms}")
+        
+        if key_symbols:
+            summary.append("\n--- CORE COMPONENT SYMBOLS ---\n" + "\n".join(key_symbols))
+            
+        return "\n\n".join(summary)
