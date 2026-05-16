@@ -16,6 +16,12 @@ from tools.code_analyzer import CodeAnalyzer
 from tools.web_tools import WebTools
 from tools.rag_engine import RAGEngine
 from tools.git_tools import GitTools
+from tools.knowledge_base import KnowledgeBase
+from tools.artifact_manager import ArtifactManager
+from tools.subagent import SubagentManager
+from agents.architect import execute_plan
+from agents.reviewer import execute_verify
+from agents.developer import execute_develop
 
 # --- Setup ---
 client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
@@ -28,6 +34,13 @@ analyzer = CodeAnalyzer(workspace_root=workspace_path)
 web_tools = WebTools()
 rag_engine = RAGEngine(workspace_root=workspace_path)
 git_tools = GitTools(workspace_root=workspace_path)
+knowledge_base = KnowledgeBase(workspace_root=workspace_path)
+artifact_manager = ArtifactManager(workspace_root=workspace_path)
+subagent_manager = SubagentManager(client=client, model_name="gemma-4-e4b")
+from tools.episode_store import EpisodeStore
+episode_store = EpisodeStore(workspace_root=workspace_path)
+from tools.browser_tool import BrowserTool
+browser_tool = BrowserTool(workspace_root=workspace_path)
 
 
 # ============================================================
@@ -53,7 +66,11 @@ def _extract_tool_calls(text: str) -> list:
         if t_name:
             data["tool"] = t_name 
             if "file" in data and "path" not in data: data["path"] = data["file"]
+            if "file_path" in data and "path" not in data: data["path"] = data["file_path"]
+            if "filepath" in data and "path" not in data: data["path"] = data["filepath"]
+            if "arg" in data and "path" not in data: data["path"] = data["arg"]
             if "text" in data and "content" not in data: data["content"] = data["text"]
+            if "args" in data and "command" not in data: data["command"] = data["args"]
             
             call_id = json.dumps(data, sort_keys=True)
             if call_id not in seen_ids:
@@ -74,10 +91,35 @@ def _extract_tool_calls(text: str) -> list:
                 candidate = text[start_idx:i+1]
                 try:
                     data = json.loads(candidate)
-                    if isinstance(data, dict) and ("tool" in data or "command" in data):
-                        _add_safe(data)
+                    if isinstance(data, dict):
+                        if "tool" in data or "command" in data:
+                            _add_safe(data)
+                        else:
+                            preceding = text[max(0, start_idx-50):start_idx].strip()
+                            match = re.search(r'(?:<\|?tool_call>|call:)\s*([a-zA-Z0-9_]+)$', preceding)
+                            if match:
+                                data["tool"] = match.group(1)
+                                _add_safe(data)
                 except:
-                    pass
+                    # Fallback: Try to fix missing quotes or double braces (Phase 3 hardening)
+                    try:
+                        cand_to_fix = candidate
+                        if cand_to_fix.startswith("{{") and cand_to_fix.endswith("}}"):
+                            cand_to_fix = cand_to_fix[1:-1]
+                            
+                        fixed = re.sub(r'([{,]\s*)([a-zA-Z0-9_]+)\s*:', r'\1"\2":', cand_to_fix)
+                        data = json.loads(fixed)
+                        if isinstance(data, dict):
+                            if "tool" in data or "command" in data:
+                                _add_safe(data)
+                            else:
+                                preceding = text[max(0, start_idx-50):start_idx].strip()
+                                match = re.search(r'(?:<\|?tool_call>|call:)\s*([a-zA-Z0-9_]+)$', preceding)
+                                if match:
+                                    data["tool"] = match.group(1)
+                                    _add_safe(data)
+                    except:
+                        pass
                 start_idx = -1
 
     return parsed
@@ -124,7 +166,9 @@ def analyze_node(state: AgentState):
     last_verification = state.get("verification_result", "")
     should_refresh = any(phrase in last_verification for phrase in ["Successfully wrote", "Successfully patched", "Successfully deleted", "Successfully moved"])
     
-    map_str = analyzer.map_codebase(max_depth=4, refresh=should_refresh)
+    speed = state.get("speed_mode", "fast")
+    depth = 2 if speed == "fast" else 4
+    map_str = analyzer.map_codebase(max_depth=depth, refresh=should_refresh)
 
     # Load project config (.999/config.md) - truncate to save context
     config_path = os.path.join(workspace_path, ".999", "config.md")
@@ -140,7 +184,7 @@ def analyze_node(state: AgentState):
 
     analysis_parts = [
         f"WORKSPACE: {workspace_path}",
-        f"CODEBASE MAP (Depth 4):\n{map_str}"
+        f"CODEBASE MAP (Depth {depth}):\n{map_str}"
     ]
     if config_content:
         analysis_parts.append(f"PROJECT CONVENTIONS:\n{config_content}")
@@ -149,7 +193,56 @@ def analyze_node(state: AgentState):
     if project_type:
         analysis_parts.append(f"PROJECT TYPE: {project_type}")
 
-    return {"analysis_result": "\n\n".join(analysis_parts)}
+    # Load available knowledge topics (Auto-suggest)
+    knowledge_list = knowledge_base.list_knowledge()
+    if "No knowledge stored yet" not in knowledge_list:
+        analysis_parts.append(knowledge_list)
+
+    # Memory Retrieval (Phase 2)
+    user_query = ""
+    for m in reversed(state.get('messages', [])):
+        if m.type == "human":
+            user_query = m.content
+            break
+    if user_query:
+        similar_episodes = episode_store.search_similar(user_query, k=2)
+        if similar_episodes:
+            memory_parts = ["PAST SIMILAR EPISODES (Memory):"]
+            for ep in similar_episodes:
+                memory_parts.append(f"Request: {ep['request']}\nSolution:\n{ep['solution']}")
+            analysis_parts.append("\n".join(memory_parts))
+
+    # Dynamic Model Routing (Phase 4)
+    complex_keywords = ["create", "implement", "refactor", "debug", "fix", "write", "patch"]
+    is_complex = any(kw in user_query.lower() for kw in complex_keywords) if user_query else False
+    
+    # Dynamic Model Selection from LM Studio
+    try:
+        models_response = client.models.list()
+        loaded_models = [m.id for m in models_response.data]
+        
+        preferred_model = "unsloth/gemma-4-e4b-it"
+        
+        if preferred_model in loaded_models:
+            chosen_model = preferred_model
+        elif loaded_models:
+            # Use the first available loaded model if preferred is not found
+            chosen_model = loaded_models[0]
+            from rich.console import Console
+            Console().print(f"[yellow]Preferred model not found. Using loaded model: {chosen_model}[/yellow]")
+        else:
+            chosen_model = preferred_model
+    except Exception:
+        # Fallback if LM Studio API fails
+        chosen_model = "unsloth/gemma-4-e4b-it"
+    from rich.console import Console
+    c = Console()
+    c.print(f"[bold magenta]Router:[/bold magenta] Selected model [cyan]{chosen_model}[/cyan] (Complexity: {'High' if is_complex else 'Low'})")
+
+    return {
+        "analysis_result": "\n\n".join(analysis_parts),
+        "model_name": chosen_model
+    }
 
 
 def _detect_project_type() -> str:
@@ -170,180 +263,16 @@ def _detect_project_type() -> str:
 def plan_node(state: AgentState):
     """
     Calls the LLM to generate a plan / response.
-    Streams tokens live to stdout for real-time feedback.
-    Falls back to non-streaming if streaming produces empty output.
+    Delegates to agents/architect.py.
     """
-    import sys
+    return execute_plan(state, client, workspace_path)
 
-    # Generate explicit tool descriptions with schemas for the model
-    descriptions = {
-        "read_file": '{"tool": "read_file", "path": "string"}',
-        "write_file": '{"tool": "write_file", "path": "string", "content": "string"}',
-        "patch_file": '{"tool": "patch_file", "path": "string", "search_string": "string", "replace_string": "string"}',
-        "list_files": '{"tool": "list_files", "path": "string"}',
-        "list_dir_tree": '{"tool": "list_dir_tree", "path": "string", "max_depth": int}',
-        "delete_file": '{"tool": "delete_file", "path": "string"}',
-        "create_dir": '{"tool": "create_dir", "path": "string"}',
-        "move_file": '{"tool": "move_file", "source_path": "string", "dest_path": "string"}',
-        "run_terminal": '{"tool": "run_terminal", "command": "string"}',
-        "search_code": '{"tool": "search_code", "pattern": "string", "file_pattern": "string"}',
-        "browse_url": '{"tool": "browse_url", "url": "string"}',
-        "index_workspace": '{"tool": "index_workspace"}',
-        "semantic_search": '{"tool": "semantic_search", "query": "string"}',
-        "get_codebase_summary": '{"tool": "get_codebase_summary"}',
-        "extract_symbols": '{"tool": "extract_symbols", "path": "string"}'
-    }
-    
-    allowed = state.get('allowed_tools', [])
-    tool_help = "\n".join([f"- {t}: {descriptions.get(t, 'JSON tool call')}" for t in allowed])
-
-    sys_prompt = ARCHITECT_SYSTEM_PROMPT.format(
-        tool_descriptions=tool_help,
-        current_dir=state.get('current_dir', workspace_path),
-        allowed_tools=", ".join(allowed),
-        analysis_result=state.get('analysis_result', ''),
-        verification_result=state.get('verification_result', '')
-    )
-
-    history = state['messages']
-    # Keep a much larger context for complex engineering tasks
-    if len(history) > 50:
-        history = history[-50:]
-
-    def _role(m):
-        if m.type == "human": return "user"
-        if m.type == "ai": return "assistant"
-        return "user" # Treat tools as user feedback for maximum compatibility
-
-    # Clean the history to remove leaked tags or redundant technical noise
-    formatted_history = []
-    for m in history:
-        content = m.content
-        
-        # Truncate extremely large results (like directory lists or full document reads)
-        # 30k chars is safe for most local models and provides plenty of context
-        if len(content) > 30000:
-            content = content[:30000] + "... (truncated for context)"
-
-        if m.type == "ai":
-            # Strip technical tags to keep the reasoning thread clean
-            content = re.sub(r'<(tool_call|\|tool_call\|).*?</(tool_call|\|tool_call\|)>', '[Action Taken]', content, flags=re.DOTALL)
-        
-        role = _role(m)
-        formatted_history.append({"role": role, "content": content})
-
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        *formatted_history
-    ]
-
-    start_time = time.time()
-    thought_and_action = ""
-    did_stream = False
-    
-    # Use Rich for clean formatting
-    from rich.console import Console
-    from rich.text import Text
-    stream_console = Console()
-    
-    # ---- Step 1: Attempt Streaming ----
-    try:
-        print("\n[bold green]999-CLI[/bold green] [dim]is thinking...[/dim]\n")
-        
-        stream = client.chat.completions.create(
-            model=state.get("model_name", "gemma-4-e4b"),
-            messages=messages,
-            temperature=0.1,
-            max_tokens=4096,
-            stream=True
-        )
-
-        silence_active = False
-        silence_patterns = ["<tool_call", "<|tool_call", "call:tool_call", "```json", '{"tool"']
-        
-        for chunk in stream:
-            try:
-                delta = chunk.choices[0].delta.content or ""
-            except:
-                continue
-                
-            thought_and_action += delta
-            
-            # AGGRESSIVE SHIELD: If a tool pattern is detected in the tail, kill the display
-            if not silence_active:
-                if any(p in thought_and_action[-50:] for p in silence_patterns):
-                    silence_active = True
-                else:
-                    # Scrub partial tags from the delta
-                    clean_delta = delta
-                    for p in silence_patterns:
-                        clean_delta = clean_delta.replace(p[:5], "")
-                    
-                    if clean_delta:
-                        stream_console.print(Text(clean_delta, style="italic dim"), end="")
-                        did_stream = True
-            else:
-                # Shield is active: check if we've reached a closing indicator
-                if any(p in thought_and_action[-20:] for p in ["</tool_call>", "</|tool_call|>", "}"]):
-                    # Wait for a potential newline after a closing brace
-                    if thought_and_action.endswith("\n") or "FINISHED" in thought_and_action[-10:]:
-                        silence_active = False
-        
-        print("\n")
-    except Exception as e:
-        thought_and_action = f"(Streaming error: {str(e)})"
-
-    # ---- Step 2: Fallback & Recovery ----
-    if not thought_and_action.strip() or len(thought_and_action.strip()) < 5:
-        try:
-            # If the model is silent, try a HIGH-TEMP nudge
-            messages.append({"role": "user", "content": "Please continue. Use a tool call if necessary."})
-            response = client.chat.completions.create(
-                model=state.get("model_name", "gemma-4-e4b"),
-                messages=messages,
-                temperature=0.7,
-                max_tokens=2048
-            )
-            thought_and_action = response.choices[0].message.content or "(Model remains silent. Check server logs.)"
-        except Exception as e:
-            thought_and_action = f"(Fatal Error: {str(e)})"
-
-    # ---- Step 3: Final Logic & Tool Fallback ----
-    state['internal_monologue'] = thought_and_action
-    
-    clean_text = _get_display_text(thought_and_action).strip()
-    if not clean_text:
-        if _extract_tool_calls(thought_and_action):
-            thought_and_action = "Executing tools...\n" + thought_and_action
-        elif not thought_and_action.strip():
-            thought_and_action = "(Model returned no text content.)"
-    
-    elapsed_ms = int((time.time() - start_time) * 1000)
-
-    return {
-        "internal_monologue": thought_and_action,
-        "did_stream": did_stream,
-        "messages": [AIMessage(content=thought_and_action)],
-        "token_usage": {
-            "prompt": 0,
-            "completion": 0,
-            "time_ms": elapsed_ms
-        }
-    }
-
-    elapsed_ms = int((time.time() - start_time) * 1000)
-
-    return {
-        "internal_monologue": thought_and_action,
-        "did_stream": did_stream,
-        "messages": [AIMessage(content=thought_and_action)],
-        "token_usage": {
-            "prompt": 0,
-            "completion": 0,
-            "time_ms": elapsed_ms
-        }
-    }
-
+def develop_node(state: AgentState):
+    """
+    Calls the Developer LLM to execute coding tasks.
+    Delegates to agents/developer.py.
+    """
+    return execute_develop(state, client, workspace_path)
 
 def safety_gate_node(state: AgentState):
     """
@@ -407,7 +336,7 @@ def execute_node(state: AgentState):
     tool_calls = _extract_tool_calls(monologue)
 
     if not tool_calls:
-        return {"verification_result": ""}
+        return {"verification_result": "No tools were needed for this step. Ready to answer."}
 
     approval_mode = state.get("approval_mode", "default")
     all_results = []
@@ -492,21 +421,39 @@ def execute_node(state: AgentState):
 
         # Show progress indicators
         if tool_name == "read_file":
-            c.print(f"[dim]📖 Reading {tool_data.get('path')}...[/dim]")
+            c.print(f"[dim]Reading {tool_data.get('path')}...[/dim]")
         elif tool_name == "search_code":
-            c.print(f"[dim]🔍 Searching for '{tool_data.get('pattern') or tool_data.get('query')}'...[/dim]")
+            c.print(f"[dim]Searching for '{tool_data.get('pattern') or tool_data.get('query')}'...[/dim]")
         elif tool_name == "semantic_search":
-            c.print(f"[dim]🧠 Semantic search: '{tool_data.get('query')}'...[/dim]")
+            c.print(f"[dim]Semantic search: '{tool_data.get('query')}'...[/dim]")
         elif tool_name == "run_terminal":
-            c.print(f"[dim]🖥️ Running: {tool_data.get('command')}...[/dim]")
+            c.print(f"[dim]Running: {tool_data.get('command')}...[/dim]")
         elif tool_name == "list_files" or tool_name == "list_dir_tree":
-            c.print(f"[dim]📁 Listing {tool_data.get('path') or '.'}...[/dim]")
+            c.print(f"[dim]Listing {tool_data.get('path') or '.'}...[/dim]")
         elif tool_name == "index_workspace":
-            c.print(f"[dim]📦 Indexing workspace...[/dim]")
+            c.print(f"[dim]Indexing workspace...[/dim]")
         elif tool_name == "get_codebase_summary":
-            c.print(f"[dim]📊 Synthesizing project summary...[/dim]")
+            c.print(f"[dim]Synthesizing project summary...[/dim]")
         elif tool_name == "extract_symbols":
-            c.print(f"[dim]🧩 Extracting symbols from {tool_data.get('path')}...[/dim]")
+            c.print(f"[dim]Extracting symbols from {tool_data.get('path')}...[/dim]")
+        elif tool_name == "dependency_graph":
+            c.print(f"[dim]Building dependency graph...[/dim]")
+        elif tool_name == "incremental_index":
+            c.print(f"[dim]Incremental re-indexing...[/dim]")
+        elif tool_name == "save_knowledge":
+            c.print(f"[dim]Saving knowledge about '{tool_data.get('topic')}'...[/dim]")
+        elif tool_name == "read_knowledge":
+            c.print(f"[dim]Reading knowledge about '{tool_data.get('topic')}'...[/dim]")
+        elif tool_name == "list_knowledge":
+            c.print(f"[dim]Listing stored knowledge...[/dim]")
+        elif tool_name == "create_artifact":
+            c.print(f"[dim]Creating artifact '{tool_data.get('title')}'...[/dim]")
+        elif tool_name == "update_artifact":
+            c.print(f"[dim]Updating artifact '{tool_data.get('artifact_id')}'...[/dim]")
+        elif tool_name == "read_artifact":
+            c.print(f"[dim]Reading artifact '{tool_data.get('artifact_id')}'...[/dim]")
+        elif tool_name == "list_artifacts":
+            c.print(f"[dim]Listing artifacts...[/dim]")
 
         result = _dispatch_tool(tool_data, tool_name, state)
         if result is not None:
@@ -549,10 +496,12 @@ def _dispatch_tool(tool_data: dict, tool_name: str, state: AgentState) -> str:
         elif tool_name == "get_file_info":
             return file_manager.get_file_info(tool_data.get("path"))
         elif tool_name == "view_file_lines":
+            start_line = tool_data.get("start_line", 1)
+            end_line = tool_data.get("end_line", start_line + 100)
             return analyzer.view_file_lines(
                 tool_data.get("path"),
-                tool_data.get("start_line", 1),
-                tool_data.get("end_line", 100)
+                start_line,
+                end_line
             )
         elif tool_name == "list_dir_tree":
             return analyzer.list_dir_tree(tool_data.get("path", "."), tool_data.get("max_depth", 2))
@@ -564,10 +513,38 @@ def _dispatch_tool(tool_data: dict, tool_name: str, state: AgentState) -> str:
             return analyzer.get_codebase_summary()
         elif tool_name == "extract_symbols":
             return analyzer.extract_symbols(tool_data.get("path", ""))
+        elif tool_name == "dependency_graph":
+            return rag_engine.get_dependency_graph()
+        elif tool_name == "incremental_index":
+            return rag_engine.incremental_index()
+        elif tool_name == "save_knowledge":
+            return knowledge_base.save_knowledge(tool_data.get("topic", ""), tool_data.get("content", ""))
+        elif tool_name == "read_knowledge":
+            return knowledge_base.read_knowledge(tool_data.get("topic", ""))
+        elif tool_name == "list_knowledge":
+            return knowledge_base.list_knowledge()
+        elif tool_name == "create_artifact":
+            return artifact_manager.create_artifact(tool_data.get("title", ""), tool_data.get("content", ""), tool_data.get("artifact_type", "other"))
+        elif tool_name == "update_artifact":
+            return artifact_manager.update_artifact(tool_data.get("artifact_id", ""), tool_data.get("content", ""))
+        elif tool_name == "read_artifact":
+            return artifact_manager.read_artifact(tool_data.get("artifact_id", ""))
+        elif tool_name == "list_artifacts":
+            return artifact_manager.list_artifacts()
+        elif tool_name == "delegate_task":
+            return subagent_manager.delegate(tool_data.get("task", ""), tool_data.get("context", ""))
         elif tool_name == "browse_url":
             return web_tools.browse_url(tool_data.get("url"))
         elif tool_name == "fetch_url":
             return web_tools.fetch_url_content(tool_data.get("url"))
+        elif tool_name == "browser_navigate":
+            return browser_tool.navigate(tool_data.get("url"))
+        elif tool_name == "browser_click":
+            return browser_tool.click(tool_data.get("selector"))
+        elif tool_name == "browser_type":
+            return browser_tool.type(tool_data.get("selector"), tool_data.get("text"))
+        elif tool_name == "browser_screenshot":
+            return browser_tool.screenshot(tool_data.get("name", "screenshot"))
         # --- Git Tools ---
         elif tool_name == "git_status":
             return git_tools.git_status()
@@ -600,79 +577,23 @@ def _dispatch_tool(tool_data: dict, tool_name: str, state: AgentState) -> str:
 def verify_node(state: AgentState):
     """
     Post-execution verification.
-    Auto-runs tests if files were modified.
-    NEW: Auto-checks localhost if a dev server was started.
+    Delegates to agents/reviewer.py.
     """
-    result_str = state.get('verification_result', '')
-    monologue = state.get('internal_monologue', '')
-
-    # 1. Auto-test discovery
-    if "Successfully wrote" in result_str or "Successfully patched" in result_str:
-        test_result = _auto_run_tests()
-        if test_result:
-            result_str += f"\n\n--- Auto Test Results ---\n{test_result}"
-
-    # 2. Auto-Heal: Check localhost if dev server started
-    if "npm run dev" in monologue or "next dev" in monologue or "npm start" in monologue:
-        from rich.console import Console
-        c = Console()
-        c.print("[dim]🏥 Auto-Heal: Checking localhost for build errors...[/dim]")
-        
-        # Give the server a few seconds to boot if it's the first time
-        time.sleep(3) 
-        try:
-            url = "http://localhost:3000"
-            browser_report = web_tools.browse_url(url)
-            
-            if "Error" in browser_report or "Build Error" in browser_report or "SyntaxError" in browser_report:
-                result_str += f"\n\n[CRITICAL BUILD ERROR DETECTED]\nSource: {url}\nReport:\n{browser_report}\nFIX THIS IMMEDIATELY."
-            else:
-                result_str += f"\n\n--- Auto-Heal Check ---\n{url} appears to be healthy."
-        except Exception as e:
-            result_str += f"\n\nAuto-Heal check failed: {str(e)}"
-
-    # Inject results as SystemMessage
-    return {
-        "verification_result": result_str,
-        "messages": [SystemMessage(content=f"Tool execution results:\n{result_str}")] if result_str else []
-    }
-
-
-def _auto_run_tests() -> str:
-    """Detects test framework and runs tests automatically."""
-    test_commands = []
-
-    if os.path.exists(os.path.join(workspace_path, "pytest.ini")) or \
-       os.path.exists(os.path.join(workspace_path, "pyproject.toml")) or \
-       os.path.exists(os.path.join(workspace_path, "setup.cfg")):
-        test_commands.append("python -m pytest --tb=short -q")
-
-    if os.path.exists(os.path.join(workspace_path, "package.json")):
-        try:
-            with open(os.path.join(workspace_path, "package.json"), 'r') as f:
-                pkg = json.load(f)
-            if "scripts" in pkg and "test" in pkg["scripts"]:
-                test_commands.append("npm test")
-        except Exception:
-            pass
-
-    if os.path.exists(os.path.join(workspace_path, "go.mod")):
-        test_commands.append("go test ./...")
-
-    if not test_commands:
-        return ""
-
-    results = []
-    for cmd in test_commands:
-        result = terminal.execute(cmd, timeout=60)
-        results.append(f"$ {cmd}\n{result}")
-
-    return "\n".join(results)
+    return execute_verify(state, client, web_tools, terminal, workspace_path, episode_store)
 
 
 # ============================================================
 #  ROUTING LOGIC
 # ============================================================
+
+def route_after_plan(state: AgentState) -> Literal["develop", "verify", "end"]:
+    intent = state.get("intent", "CODE_CHANGE")
+    if intent == "READ_ONLY":
+        from rich.console import Console
+        c = Console()
+        c.print("[bold cyan]Router:[/bold cyan] Read-only task detected. Skipping Developer and finishing.")
+        return "end"
+    return "develop"
 
 def route_safety(state: AgentState) -> Literal["execute", "blocked"]:
     risk = state.get("risk_assessment", {})
@@ -683,15 +604,39 @@ def route_safety(state: AgentState) -> Literal["execute", "blocked"]:
 
 def should_continue(state: AgentState) -> Literal["analyze", "end"]:
     monologue = state.get("internal_monologue", "")
-
-    if "FINISHED" in monologue:
+    score = state.get("success_score", 1.0)
+    intent = state.get("intent", "CODE_CHANGE")
+    
+    if intent == "READ_ONLY" and not state.get("verification_result"):
+        from rich.console import Console
+        c = Console()
+        c.print("[bold cyan]Router:[/bold cyan] Read-only task with no execution results. Ending loop.")
         return "end"
 
-    # Continue the loop if the model used ANY tool call format
-    if _has_tool_calls(monologue):
+    if score < 0.5:
+        from rich.console import Console
+        c = Console()
+        c.print("[yellow]Auto-Correction: Success score low (< 0.5). Routing back to analyze...[/yellow]")
         return "analyze"
 
-    return "end"
+    # Did we just run actual tools to get data?
+    last_result = state.get("verification_result", "")
+    just_ran_tools = bool(last_result and "No tools were needed" not in last_result)
+
+    # For read-only tasks, loop back to analyze to generate the final answer ONLY IF we just got real tool results
+    if intent == "READ_ONLY" and just_ran_tools:
+        from rich.console import Console
+        c = Console()
+        c.print("[bold cyan]Router:[/bold cyan] Read-only task with tool results. Routing back to analyze for final answer.")
+        return "analyze"
+
+    if state.get("finished") or "FINISHED" in monologue:
+        return "end"
+
+    # Default to looping back so the agent can chain actions until it explicitly declares FINISHED
+    from rich.console import Console
+    Console().print("[bold cyan]Router:[/bold cyan] Task not marked FINISHED. Routing back to analyze for next step.")
+    return "analyze"
 
 
 # ============================================================
@@ -702,13 +647,15 @@ workflow = StateGraph(AgentState)
 
 workflow.add_node("analyze", analyze_node)
 workflow.add_node("plan", plan_node)
+workflow.add_node("develop", develop_node)
 workflow.add_node("safety_gate", safety_gate_node)
 workflow.add_node("execute", execute_node)
 workflow.add_node("verify", verify_node)
 
 workflow.set_entry_point("analyze")
 workflow.add_edge("analyze", "plan")
-workflow.add_edge("plan", "safety_gate")
+workflow.add_edge("plan", "develop")
+workflow.add_edge("develop", "safety_gate")
 
 workflow.add_conditional_edges(
     "safety_gate",

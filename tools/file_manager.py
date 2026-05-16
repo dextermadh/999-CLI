@@ -68,8 +68,11 @@ class LocalFileManager:
         except Exception as e:
             return [f"Error: {str(e)}"]
 
-    def read_file(self, file_path: str) -> str:
-        """Reads content of a local file, supporting text, PDF, Word, and Excel."""
+    def read_file(self, file_path: str, max_lines: int = 300) -> str:
+        """Reads content of a local file, supporting text, PDF, Word, and Excel.
+        For code/text files, intelligently truncates to max_lines to prevent
+        context window overflow. Use view_file_lines for specific ranges.
+        """
         target_file = (self.root / file_path).resolve()
         
         if not self._is_safe_path(target_file):
@@ -81,8 +84,25 @@ class LocalFileManager:
         ext = target_file.suffix.lower()
         
         try:
-            if ext in ['.txt', '.py', '.js', '.ts', '.html', '.css', '.md', '.json', '.yaml', '.yml', '.sql', '.sh']:
-                return target_file.read_text(encoding="utf-8")
+            if ext in ['.txt', '.py', '.js', '.ts', '.tsx', '.jsx', '.html', '.css', '.md', '.json', '.yaml', '.yml', '.sql', '.sh', '.go', '.rs', '.java', '.c', '.cpp', '.h', '.toml', '.cfg', '.ini', '.bat', '.ps1']:
+                content = target_file.read_text(encoding="utf-8")
+                lines = content.split('\n')
+                total_lines = len(lines)
+                
+                # Intelligent truncation for large files
+                if total_lines > max_lines:
+                    head_count = max_lines - 50  # e.g., 250 lines from top
+                    tail_count = 50
+                    omitted = total_lines - head_count - tail_count
+                    head = '\n'.join(lines[:head_count])
+                    tail = '\n'.join(lines[-tail_count:])
+                    return (
+                        f"{head}\n\n"
+                        f"... [{omitted} lines omitted — file has {total_lines} total lines. "
+                        f"Use view_file_lines for specific ranges.] ...\n\n"
+                        f"{tail}"
+                    )
+                return content
             
             elif ext == '.pdf':
                 from pypdf import PdfReader
@@ -96,7 +116,11 @@ class LocalFileManager:
                 if ocr_text:
                     text.append("\n[DEEP SCAN: OCR TEXT FROM IMAGES]\n" + ocr_text)
                 
-                return "\n".join(text)
+                full_text = "\n".join(text)
+                # Truncate very large documents
+                if len(full_text) > 15000:
+                    return full_text[:15000] + f"\n\n... [Document truncated at 15000 chars. Total: {len(full_text)} chars.]"  
+                return full_text
                 
             elif ext == '.docx':
                 import docx

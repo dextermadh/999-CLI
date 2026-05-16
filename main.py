@@ -95,6 +95,7 @@ def handle_slash_command(cmd: str, inputs: dict, session_file: Path, cumulative_
         help_table.add_row("/mode [yolo|safe|default]", "Change approval mode")
         help_table.add_row("/model", "Select LLM model from local server")
         help_table.add_row("/tokens", "Show cumulative token usage")
+        help_table.add_row("/speed [fast|deep]", "Toggle between fast and deep analysis modes")
         help_table.add_row("/help", "Show this help")
         help_table.add_row("exit / quit", "Exit 999-CLI")
         console.print(help_table)
@@ -247,6 +248,15 @@ def handle_slash_command(cmd: str, inputs: dict, session_file: Path, cumulative_
             console.print("[yellow]Usage: /mode [yolo|safe|default][/yellow]")
         return True
 
+    elif cmd.startswith("/speed"):
+        parts = cmd.split()
+        if len(parts) == 2 and parts[1] in ["fast", "deep"]:
+            inputs["speed_mode"] = parts[1]
+            console.print(f"[green]✓ Speed mode set to: [bold]{parts[1]}[/bold][/green]")
+        else:
+            console.print("[yellow]Usage: /speed [fast|deep][/yellow]")
+        return True
+
     elif cmd == "/tokens":
         console.print(Panel(
             f"Prompt tokens: {cumulative_tokens['prompt']}\n"
@@ -294,7 +304,9 @@ def main():
         "allowed_tools": [
             "read_file", "write_file", "list_files", "patch_file", "search_code", "run_terminal",
             "delete_file", "move_file", "create_dir", "get_file_info", "view_file_lines", "fetch_url", "browse_url",
-            "list_dir_tree", "index_workspace", "semantic_search",
+            "list_dir_tree", "index_workspace", "semantic_search", "get_codebase_summary", "extract_symbols",
+            "dependency_graph", "incremental_index", "save_knowledge", "read_knowledge", "list_knowledge",
+            "create_artifact", "update_artifact", "read_artifact", "list_artifacts", "delegate_task",
             "git_status", "git_diff", "git_log", "git_commit", "git_checkout", "git_stash", "git_stash_pop"
         ],
         "internal_monologue": "",
@@ -302,6 +314,7 @@ def main():
         "verification_result": "",
         "approval_mode": approval_mode,
         "model_name": "gemma-4-e4b",  # Default model
+        "speed_mode": "fast",  # Default to fast mode
     }
 
     while True:
@@ -355,7 +368,8 @@ def main():
                             elif node_name == "verify":
                                 result = node_state.get('verification_result', '')
                                 if result and "successfully" not in result:
-                                    console.print(Panel(result[:1000], title="[bold blue]📋 Results[/bold blue]", border_style="blue"))
+                                    display_result = result[:1000] + "\n\n... [Output Truncated for UI Display. The Agent received the full result!] ..." if len(result) > 1000 else result
+                                    console.print(Panel(display_result, title="[bold blue]📋 Results[/bold blue]", border_style="blue"))
 
                             # Handle UI updates
                             if node_name == "plan":

@@ -18,21 +18,34 @@
 - **Git Checkpoints**: Automatically stashes changes before complex file operations, allowing for instant `/undo`.
 
 ### 🛠️ Integrated Toolset
-- **File Manager**: Precise reading, writing, patching (diff-based), and searching. Now supports **PDF, Word (.docx), Excel (.xlsx), and CSV**.
+- **File Manager**: Precise reading, writing, patching (diff-based), and searching. Supports **PDF, Word (.docx), Excel (.xlsx), and CSV**. Now includes **Smart Truncation** (300-line budget) for code files to prevent context window overflow.
 - **Terminal**: Execute build commands, install dependencies, and run scripts.
 - **Git Integration**: Full control over status, diffs, commits, and branch management.
 - **Browser & Web**: Fetch documentation or browse local dev servers for verification.
-- **RAG Engine**: Semantic search and workspace indexing with **smart chunking** for deep architectural understanding.
+- **Advanced RAG Engine**: Hybrid search combining vector and keyword retrieval for deep architectural understanding.
 
-### 🆕 Advanced Intelligence Layers
+### 🆕 Advanced Intelligence Layers (May 2026 Overhaul)
+- **Hybrid Search (FAISS + BM25)**: Combines semantic understanding with keyword precision using Reciprocal Rank Fusion (RRF).
+- **AST-Aware Chunking**: Python files are chunked respecting function and class boundaries, preserving docstrings and decorators.
+- **File-Level Summaries**: Generates synthetic summaries for every file, enabling the system to answer file-wide queries.
+- **Dependency Graph Mapping**: New `dependency_graph` tool to map local Python imports and understand module relationships.
+- **Incremental Indexing**: Only re-indexes files that have changed, saving massive amounts of time.
+- **Staleness Auto-Heal**: Automatically detects when files are modified and updates the index in the background.
 - **Symbol Intelligence**: AST-based extraction of functions, classes, and methods for instant codebase mapping.
 - **Vision & OCR Intelligence**: Ability to "read" images and extract text from visuals inside PDFs and Word documents (requires Tesseract OCR).
-- **Performance Caching**: Intelligent codebase mapping cache to maintain high speed in massive enterprise repositories.
-- **Automated Synthesis**: New `get_codebase_summary` tool for instant project-level insights and architectural overviews.
+
+### 🛠️ System Hardening & Robustness (Recent Updates)
+- **Intelligent Tool Argument Parsing**: Hardened the tool parser to handle alternative argument names hallucinated by smaller models (e.g., mapping `file_path`, `filepath`, and `arg` to `path`).
+- **Read-Only Loop Priority**: Fixed a critical bug where premature `FINISHED` flags bypassed data retrieval. The system now strictly forces a loop-back to the Architect after retrieving read-only data, ensuring complete answers are generated.
+- **Smart Symbol Chunking**: Improved the reading of large codebases by instructing the Architect to use `extract_symbols` and `view_file_lines` for large files instead of full-file reads, preventing context window truncation.
+- **UI Truncation Transparency**: Updated the CLI interface to explicitly warn users when tool outputs are truncated for display purposes, clarifying that the underlying agent still received the complete data.
+- **Robust Read-Only Fallbacks**: Handled edge cases where the model decides "No action is needed", ensuring the Reviewer scores the interaction correctly and prevents infinite loops.
+- **True Autonomy Unlocked**: Fixed a core routing bug where the loop ended unconditionally after one step if successful. Now, the system defaults to looping back to the Architect until it explicitly declares 'FINISHED', enabling autonomous chaining of multi-step operations.
 
 ### 🏥 Auto-Heal & Auto-Test
 - **Auto-Test**: Automatically detects and runs `pytest`, `npm test`, or `go test` after modifications.
 - **Auto-Heal**: Monitors local development servers (e.g., `localhost:3000`) for build errors or crashes and attempts to fix them immediately.
+
 
 ---
 
@@ -90,6 +103,7 @@ Start the CLI from any project directory:
 | `/config` | Initialize project-specific configuration (`.999/config.md`). |
 | `/model` | Switch between models available on your local server. |
 | `/mode` | Toggle between `yolo`, `safe`, and `default` modes. |
+| `/speed` | Toggle between `fast` and `deep` analysis modes. |
 | `/compact` | Summarize long chat histories to save tokens. |
 | `/stop` | Kill all background processes (dev servers). |
 | `/tokens` | View token usage and inference stats for the session. |

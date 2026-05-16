@@ -19,6 +19,16 @@ class LocalTerminal:
             "ng serve", "vite", "next dev"
         ]
         
+        # Windows fallbacks for Linux commands
+        if os.name == 'nt':
+            cmd_strip = command.strip()
+            if cmd_strip == "ls":
+                command = "dir"
+            elif cmd_strip == "ls -R":
+                command = "dir /s"
+            elif cmd_strip.startswith("ls "):
+                command = command.replace("ls ", "dir ")
+        
         # Detect installers/heavy tasks (that take time but DO exit)
         heavy_tasks = ["npm install", "npm i", "npx create-", "pip install", "yarn install"]
         
@@ -43,6 +53,13 @@ class LocalTerminal:
             
             output = result.stdout if result.stdout else ""
             error = result.stderr if result.stderr else ""
+            
+            # Truncate output if too long to prevent context overflow (Phase 3 hardening)
+            max_len = 3000
+            if len(output) > max_len:
+                output = output[:max_len] + f"\n... (output truncated, total length: {len(output)} chars)"
+            if len(error) > max_len:
+                error = error[:max_len] + f"\n... (error truncated, total length: {len(error)} chars)"
             
             if result.returncode == 0:
                 return f"Success:\n{output}"
