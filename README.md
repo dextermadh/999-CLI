@@ -24,7 +24,7 @@
 - **Browser & Web**: Fetch documentation or browse local dev servers for verification.
 - **Advanced RAG Engine**: Hybrid search combining vector and keyword retrieval for deep architectural understanding.
 
-### 🆕 Advanced Intelligence Layers (May 2026 Overhaul)
+### 🆕 Advanced Intelligence Layers 
 - **Hybrid Search (FAISS + BM25)**: Combines semantic understanding with keyword precision using Reciprocal Rank Fusion (RRF).
 - **AST-Aware Chunking**: Python files are chunked respecting function and class boundaries, preserving docstrings and decorators.
 - **File-Level Summaries**: Generates synthetic summaries for every file, enabling the system to answer file-wide queries.
@@ -51,16 +51,22 @@
 
 ## 🏗️ Architecture
 
+The system uses a **Multi-Agent Swarm** approach to divide and conquer tasks:
+- **Architect Agent** (`plan_node`): Analyzes the codebase and formulates a high-level plan.
+- **Developer Agent** (`develop_node`): Translates the plan into specific tool calls or code edits.
+- **Reviewer Agent** (`verify_node`): Evaluates the execution results, runs tests, and scores the success to determine if the loop should continue.
+
 ```mermaid
 graph TD
     User([User Input]) --> Analyze[Analyze Node: Codebase Map & Config]
-    Analyze --> Plan[Plan Node: LLM Reasoning]
-    Plan --> Safety{Safety Gate: Risk Analysis}
+    Analyze --> Plan[Plan Node: Architect Agent]
+    Plan --> Develop[Develop Node: Developer Agent]
+    Develop --> Safety{Safety Gate: Risk Classifier}
     Safety -- Blocked --> END([End Turn])
     Safety -- Allowed --> Execute[Execute Node: Tool Dispatch]
-    Execute --> Verify[Verify Node: Auto-Test & Auto-Heal]
-    Verify -- Tool Call Detected --> Analyze
-    Verify -- Finished --> END
+    Execute --> Verify[Verify Node: Reviewer Agent]
+    Verify -- "Read-Only Results / Not Finished" --> Analyze
+    Verify -- "Finished / No Results" --> END
 ```
 
 ---
