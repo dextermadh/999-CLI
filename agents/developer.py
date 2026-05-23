@@ -21,8 +21,10 @@ def execute_develop(state, client, workspace_path):
     """
     Calls the LLM to execute coding tasks based on the plan.
     """
-    # Load available tools
-    allowed = ["read_file", "write_file", "patch_file", "run_terminal", "browser_navigate", "browser_click", "browser_type", "browser_screenshot"]
+    # Load available tools dynamically from state
+    allowed = state.get('allowed_tools', [])
+    if not allowed:
+        allowed = ["read_file", "write_file", "patch_file", "run_terminal", "browser_navigate", "browser_click", "browser_type", "browser_screenshot"]
     tool_help = "\n".join([f"- {t}" for t in allowed])
 
     # Get the plan from the state (we assume the Architect stored it in the state)

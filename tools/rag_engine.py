@@ -324,7 +324,17 @@ class RAGEngine:
         with open(self.index_dir / "metadata.json", 'w', encoding='utf-8') as f:
             json.dump({"indexed_at": self._indexed_at, "entries": self.metadata}, f)
             
-        return f"Successfully indexed {len(chunks)} chunks ({file_count} files) across the workspace."
+        # --- Build Code Knowledge Graph ---
+        kg_status = ""
+        try:
+            from tools.knowledge_graph_builder import KnowledgeGraphBuilder
+            kg_builder = KnowledgeGraphBuilder(str(self.workspace))
+            kg_builder.build_graph()
+            kg_status = " and built Code Knowledge Graph"
+        except Exception as e:
+            kg_status = f" (Knowledge Graph build failed: {str(e)})"
+            
+        return f"Successfully indexed {len(chunks)} chunks ({file_count} files) across the workspace{kg_status}."
 
     def incremental_index(self) -> str:
         """Re-indexes only files that have changed since the last full index.
@@ -590,4 +600,79 @@ class RAGEngine:
             except Exception:
                 results.append(f"### File: {meta['file']} (Unreadable or modified)\n")
                 
-        return "\n".join(results)
+        combined_str = "\n".join(results)
+        
+        # 4. Integrate GraphRAG structural context
+        graph_context = self._get_graph_rag_context(query)
+        if graph_context:
+            combined_str = graph_context + "\n---\n" + combined_str
+            
+        return combined_str
+
+    def _get_graph_rag_context(self, query: str) -> str:
+        """Looks up nodes in the knowledge graph that match keywords in the query and returns their relationship context."""
+        try:
+            import re
+            from tools.knowledge_graph import CodeKnowledgeGraph
+            kg = CodeKnowledgeGraph()
+            kg_path = self.workspace / ".999" / "knowledge_graph.json"
+            if not kg.load_from_disk(str(kg_path)):
+                return ""
+            
+            # Simple keyword matching against node IDs, names, and paths
+            matched_nodes = []
+            tokens = re.findall(r'[a-zA-Z0-9_\-\.]+', query.lower())
+            
+            for node_id, node_data in kg.nodes.items():
+                node_type = node_data["type"]
+                name = node_data.get("properties", {}).get("name", "").lower()
+                path = node_data.get("properties", {}).get("path", "").lower()
+                
+                matched = False
+                for token in tokens:
+                    if len(token) < 3:
+                        continue
+                    if token == name or token in path or token in node_id.lower():
+                        matched = True
+                        break
+                
+                if matched:
+                    matched_nodes.append((node_id, node_data))
+                    
+            if not matched_nodes:
+                return ""
+                
+            # Construct a small structural relations summary
+            lines = ["### 🕸️ Knowledge Graph Structural Context\n"]
+            for node_id, node_data in matched_nodes[:3]: # Limit to top 3 matched nodes to avoid context bloat
+                node_type = node_data["type"]
+                props = node_data.get("properties", {})
+                name = props.get("name", node_id)
+                lines.append(f"**Symbol**: `{name}` ({node_type.upper()})")
+                
+                # Check outgoing edges
+                outgoing = []
+                for edge_type, targets in node_data.get("edges", {}).items():
+                    for t in targets:
+                        t_name = kg.nodes.get(t, {}).get("properties", {}).get("name", t)
+                        outgoing.append(f"  - {edge_type} -> `{t_name}`")
+                
+                # Check incoming edges
+                incoming = []
+                for source_id, s_data in kg.nodes.items():
+                    for edge_type, targets in s_data.get("edges", {}).items():
+                        if node_id in targets:
+                            s_name = s_data.get("properties", {}).get("name", source_id)
+                            incoming.append(f"  - `{s_name}` -> {edge_type}")
+                            
+                if outgoing:
+                    lines.append("  *Outgoing Relations*:")
+                    lines.extend(outgoing[:4])
+                if incoming:
+                    lines.append("  *Incoming Relations*:")
+                    lines.extend(incoming[:4])
+                lines.append("")
+                    
+            return "\n".join(lines) + "\n"
+        except Exception:
+            return ""

@@ -37,7 +37,8 @@ def execute_plan(state, client, workspace_path):
         "update_artifact": '{"tool": "update_artifact", "artifact_id": "string", "content": "string"}',
         "read_artifact": '{"tool": "read_artifact", "artifact_id": "string"}',
         "list_artifacts": '{"tool": "list_artifacts"}',
-        "delegate_task": '{"tool": "delegate_task", "task": "string", "context": "string"}'
+        "delegate_task": '{"tool": "delegate_task", "task": "string", "context": "string"}',
+        "delegate_parallel": '{"tool": "delegate_parallel", "tasks": [{"name": "string", "task": "string", "context": "string"}]}'
     }
     
     allowed = state.get('allowed_tools', [])
@@ -108,7 +109,9 @@ def execute_plan(state, client, workspace_path):
         )
 
         silence_active = False
+        brace_depth = 0
         silence_patterns = ["<tool_call", "<|tool_call", "call:tool_call", "```json", '{"tool"']
+        show_tokens = False  # Suppress intent and thinking blocks
         
         for chunk in stream:
             try:
@@ -118,20 +121,45 @@ def execute_plan(state, client, workspace_path):
                 
             thought_and_action += delta
             
-            if not silence_active:
-                if any(p in thought_and_action[-50:] for p in silence_patterns):
-                    silence_active = True
+            # Enable token displaying only once we hit the final RESPONSE: or PLAN: block
+            if not show_tokens:
+                if "RESPONSE:" in thought_and_action or "PLAN:" in thought_and_action:
+                    show_tokens = True
+                    # Skip printing the transition header keyword itself for maximum polish
+                    continue
+            
+            if show_tokens:
+                if not silence_active:
+                    if any(p in thought_and_action[-50:] for p in silence_patterns):
+                        silence_active = True
+                        brace_depth = 0
+                        # Initialize brace depth by counting braces in delta
+                        for char in delta:
+                            if char == '{':
+                                brace_depth += 1
+                            elif char == '}':
+                                brace_depth = max(0, brace_depth - 1)
+                    else:
+                        clean_delta = delta
+                        for p in silence_patterns:
+                            clean_delta = clean_delta.replace(p[:5], "")
+                        
+                        if clean_delta:
+                            stream_console.print(Text(clean_delta, style="italic dim"), end="")
+                            did_stream = True
                 else:
-                    clean_delta = delta
-                    for p in silence_patterns:
-                        clean_delta = clean_delta.replace(p[:5], "")
+                    # Track brace depth for characters in the delta
+                    for char in delta:
+                        if char == '{':
+                            brace_depth += 1
+                        elif char == '}':
+                            brace_depth = max(0, brace_depth - 1)
                     
-                    if clean_delta:
-                        stream_console.print(Text(clean_delta, style="italic dim"), end="")
-                        did_stream = True
-            else:
-                if any(p in thought_and_action[-20:] for p in ["</tool_call>", "</|tool_call|>", "}"]):
-                    if thought_and_action.endswith("\n") or "FINISHED" in thought_and_action[-10:]:
+                    # Check for explicit closing tags or code blocks
+                    has_closing_tag = any(tag in thought_and_action[-20:] for tag in ["</tool_call>", "</|tool_call|>", "```"])
+                    
+                    # Deactivate silence when depth returns to 0 (and we saw a closing brace) or when closing tag is matched
+                    if (brace_depth == 0 and "}" in delta) or has_closing_tag:
                         silence_active = False
         
         print("\n")

@@ -58,3 +58,8 @@ class AgentState(TypedDict):
     
     # Token usage tracking per turn
     token_usage: Optional[dict]
+    
+    # --- Loop Control ---
+    
+    # Tracks how many times the graph has looped through analyze (prevents infinite loops)
+    _loop_count: Optional[int]

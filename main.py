@@ -96,6 +96,9 @@ def handle_slash_command(cmd: str, inputs: dict, session_file: Path, cumulative_
         help_table.add_row("/model", "Select LLM model from local server")
         help_table.add_row("/tokens", "Show cumulative token usage")
         help_table.add_row("/speed [fast|deep]", "Toggle between fast and deep analysis modes")
+        help_table.add_row("/graph", "Rebuild the Codebase Knowledge Graph")
+        help_table.add_row("/trace <symbol>", "Trace dependencies & call path of a class or function")
+        help_table.add_row("/impact <file>", "Perform structural change impact analysis")
         help_table.add_row("/help", "Show this help")
         help_table.add_row("exit / quit", "Exit 999-CLI")
         console.print(help_table)
@@ -222,13 +225,17 @@ def handle_slash_command(cmd: str, inputs: dict, session_file: Path, cumulative_
 
                     data = json.dumps({"model": selected_model}).encode("utf-8")
                     req = urllib.request.Request(load_url, data=data, headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=30) as response:
+                    with urllib.request.urlopen(req, timeout=120) as response:
                         if response.status == 200:
                             console.print(f"[green]✓ Model loaded successfully in LM Studio.[/green]")
                         else:
                             console.print(f"[yellow]⚠ Server returned status {response.status} during load.[/yellow]")
                 except Exception as e:
-                    console.print(f"[dim]Note: Could not auto-load in LM Studio. Error: {str(e)}[/dim]")
+                    err_msg = str(e).lower()
+                    if "timed out" in err_msg or "timeout" in err_msg:
+                        console.print(f"[yellow]⚠ Auto-load request timed out after 120s. The model may still be loading/active in LM Studio. Please check LM Studio's UI or logs.[/yellow]")
+                    else:
+                        console.print(f"[dim]Note: Could not auto-load in LM Studio. Error: {str(e)}[/dim]")
 
             console.print(f"[green]✓ Model set to: [bold]{selected_model}[/bold][/green]")
         except Exception as e:
@@ -271,6 +278,172 @@ def handle_slash_command(cmd: str, inputs: dict, session_file: Path, cumulative_
         console.print(f"[green]✓ {result}[/green]")
         return True
 
+    elif cmd == "/graph":
+        with console.status("[bold blue]Building Codebase Knowledge Graph...[/bold blue]"):
+            try:
+                from tools.knowledge_graph_builder import KnowledgeGraphBuilder
+                builder = KnowledgeGraphBuilder(os.getcwd())
+                builder.build_graph()
+                console.print("[green]✓ Codebase Knowledge Graph successfully rebuilt! Saved to .999/knowledge_graph.json[/green]")
+            except Exception as e:
+                console.print(f"[red]Error building Knowledge Graph: {str(e)}[/red]")
+        return True
+
+    elif cmd.startswith("/trace"):
+        parts = cmd.split()
+        if len(parts) < 2:
+            console.print("[yellow]Usage: /trace <symbol_name>[/yellow]")
+            return True
+            
+        symbol = parts[1]
+        with console.status(f"[bold blue]Tracing symbol '{symbol}' in Codebase Knowledge Graph...[/bold blue]"):
+            try:
+                from tools.knowledge_graph import CodeKnowledgeGraph
+                kg = CodeKnowledgeGraph()
+                kg_path = Path(os.getcwd()) / ".999" / "knowledge_graph.json"
+                if not kg_path.exists():
+                    console.print("[yellow]Knowledge Graph does not exist yet. Please run /graph first to build it.[/yellow]")
+                    return True
+                if not kg.load_from_disk(str(kg_path)):
+                    console.print("[red]Error loading Knowledge Graph.[/red]")
+                    return True
+                
+                # Find matching nodes
+                matches = []
+                for n_id, n_data in kg.nodes.items():
+                    name = n_data.get("properties", {}).get("name", "")
+                    if name.lower() == symbol.lower() or symbol.lower() in n_id.lower():
+                        matches.append((n_id, n_data))
+                
+                if not matches:
+                    console.print(f"[yellow]Symbol '{symbol}' not found in the Knowledge Graph.[/yellow]")
+                    return True
+                
+                for n_id, n_data in matches[:3]: # Limit to top 3 matching symbols to prevent print bloat
+                    n_type = n_data["type"]
+                    props = n_data.get("properties", {})
+                    name = props.get("name", n_id)
+                    path = props.get("path", n_id.split(':')[1] if ':' in n_id else "")
+                    start_line = props.get("start_line", "?")
+                    
+                    console.print(f"\n[bold cyan]🕸️ Traced Symbol: {name} ({n_type.upper()})[/bold cyan]")
+                    console.print(f"  [dim]Defined in: {path} (Line {start_line})[/dim]")
+                    
+                    # Outgoing edges (what this calls or defines)
+                    outgoing = []
+                    for e_type, targets in n_data.get("edges", {}).items():
+                        for t in targets:
+                            t_name = kg.nodes.get(t, {}).get("properties", {}).get("name", t)
+                            outgoing.append(f"    - {e_type} -> [green]{t_name}[/green]")
+                            
+                    # Incoming edges (what calls or references this)
+                    incoming = []
+                    for s_id, s_data in kg.nodes.items():
+                        for e_type, targets in s_data.get("edges", {}).items():
+                            if n_id in targets:
+                                s_name = s_data.get("properties", {}).get("name", s_id)
+                                incoming.append(f"    - [green]{s_name}[/green] -> {e_type}")
+                                
+                    if outgoing:
+                        console.print("  [bold magenta]Outward Relations (Invocations/Definitions):[/bold magenta]")
+                        for out in outgoing[:8]:
+                            console.print(out)
+                        if len(outgoing) > 8:
+                            console.print(f"    [dim]... and {len(outgoing)-8} more outgoing relations[/dim]")
+                    else:
+                        console.print("  [dim]No outgoing invocations detected.[/dim]")
+                        
+                    if incoming:
+                        console.print("  [bold yellow]Inward Relations (Dependents/Callers):[/bold yellow]")
+                        for inc in incoming[:8]:
+                            console.print(inc)
+                        if len(incoming) > 8:
+                            console.print(f"    [dim]... and {len(incoming)-8} more incoming relations[/dim]")
+                    else:
+                        console.print("  [dim]No callers/references detected.[/dim]")
+            except Exception as e:
+                console.print(f"[red]Error tracing symbol: {str(e)}[/red]")
+        return True
+
+    elif cmd.startswith("/impact"):
+        parts = cmd.split()
+        if len(parts) < 2:
+            console.print("[yellow]Usage: /impact <file_path_or_class_name>[/yellow]")
+            return True
+            
+        target = parts[1]
+        with console.status(f"[bold blue]Calculating change impact footprint for '{target}'...[/bold blue]"):
+            try:
+                from tools.knowledge_graph import CodeKnowledgeGraph
+                kg = CodeKnowledgeGraph()
+                kg_path = Path(os.getcwd()) / ".999" / "knowledge_graph.json"
+                if not kg_path.exists():
+                    console.print("[yellow]Knowledge Graph does not exist yet. Please run /graph first to build it.[/yellow]")
+                    return True
+                if not kg.load_from_disk(str(kg_path)):
+                    console.print("[red]Error loading Knowledge Graph.[/red]")
+                    return True
+                
+                # Find matching node
+                target_node_id = None
+                for n_id, n_data in kg.nodes.items():
+                    name = n_data.get("properties", {}).get("name", "")
+                    path = n_data.get("properties", {}).get("path", "")
+                    if target.lower() in n_id.lower() or target.lower() == name.lower() or target.lower() in path.lower():
+                        target_node_id = n_id
+                        break
+                        
+                if not target_node_id:
+                    console.print(f"[yellow]Target '{target}' not found in Knowledge Graph.[/yellow]")
+                    return True
+                
+                # Run reverse BFS to find all incoming dependents
+                # Queue stores: (node_id, current_distance)
+                queue = [(target_node_id, 0)]
+                visited = {target_node_id}
+                
+                impacted_by_distance = {} # distance -> List[node_data]
+                
+                while queue:
+                    curr_id, dist = queue.pop(0)
+                    if dist > 0:
+                        if dist not in impacted_by_distance:
+                            impacted_by_distance[dist] = []
+                        impacted_by_distance[dist].append(kg.nodes[curr_id])
+                        
+                    # Find all nodes that have an edge pointing TO curr_id
+                    for source_id, s_data in kg.nodes.items():
+                        if source_id in visited:
+                            continue
+                        for edge_type, targets in s_data.get("edges", {}).items():
+                            if curr_id in targets:
+                                visited.add(source_id)
+                                queue.append((source_id, dist + 1))
+                                break
+                                
+                t_data = kg.nodes[target_node_id]
+                t_name = t_data.get("properties", {}).get("name", target_node_id)
+                t_type = t_data["type"]
+                
+                console.print(f"\n[bold red]💥 Impact Analysis Footprint (Blast Radius) for {t_name} ({t_type.upper()})[/bold red]")
+                
+                if not impacted_by_distance:
+                    console.print("[green]✓ Isolated Component: No downstream dependents found. Safe to modify with zero structural impact![/green]")
+                    return True
+                    
+                console.print(f"[yellow]⚠ Modifying this component has a potential blast radius of {len(visited) - 1} dependents:[/yellow]\n")
+                
+                for dist in sorted(impacted_by_distance.keys()):
+                    console.print(f"  [bold magenta]Distance {dist} (Blast Zone):[/bold magenta]")
+                    for dep in impacted_by_distance[dist]:
+                        d_name = dep.get("properties", {}).get("name", dep["id"])
+                        d_type = dep["type"]
+                        d_path = dep.get("properties", {}).get("path", "")
+                        console.print(f"    • [yellow]{d_name}[/yellow] ({d_type}) [dim]in {d_path}[/dim]")
+            except Exception as e:
+                console.print(f"[red]Error calculating change impact: {str(e)}[/red]")
+        return True
+
     return False
 
 # --- Main ---
@@ -306,8 +479,9 @@ def main():
             "delete_file", "move_file", "create_dir", "get_file_info", "view_file_lines", "fetch_url", "browse_url",
             "list_dir_tree", "index_workspace", "semantic_search", "get_codebase_summary", "extract_symbols",
             "dependency_graph", "incremental_index", "save_knowledge", "read_knowledge", "list_knowledge",
-            "create_artifact", "update_artifact", "read_artifact", "list_artifacts", "delegate_task",
-            "git_status", "git_diff", "git_log", "git_commit", "git_checkout", "git_stash", "git_stash_pop"
+            "create_artifact", "update_artifact", "read_artifact", "list_artifacts", "delegate_task", "delegate_parallel",
+            "git_status", "git_diff", "git_log", "git_commit", "git_checkout", "git_stash", "git_stash_pop",
+            "trace_symbol", "impact_analysis", "run_security_scan", "run_unit_tests", "profile_performance"
         ],
         "internal_monologue": "",
         "analysis_result": "",
@@ -334,6 +508,16 @@ def main():
 
             inputs["messages"].append(HumanMessage(content=user_input))
 
+            # Reset stale turn-specific state
+            inputs["internal_monologue"] = ""
+            inputs["analysis_result"] = ""
+            inputs["verification_result"] = ""
+            inputs["finished"] = False
+            inputs["plan"] = None
+            inputs["_loop_count"] = 0
+            inputs["risk_assessment"] = None
+            inputs["success_score"] = None
+
             # Track the agent's final response for history
             agent_response = ""
             turn_start = time.time()
@@ -349,7 +533,9 @@ def main():
                             # SYNC: Correctly MERGE state updates
                             for key, value in node_state.items():
                                 if key == "messages" and isinstance(value, list):
-                                    inputs["messages"].extend(value)
+                                    for msg in value:
+                                        if not any(m.type == msg.type and m.content == msg.content for m in inputs["messages"]):
+                                            inputs["messages"].append(msg)
                                 else:
                                     inputs[key] = value
 
@@ -374,7 +560,7 @@ def main():
                             # Handle UI updates
                             if node_name == "plan":
                                 monologue = node_state.get('internal_monologue', '')
-                                if event['plan'].get('internal_monologue') and not event['plan'].get('did_stream', False):
+                                if event['plan'].get('internal_monologue'):
                                     display_text = _get_display_text(monologue)
                                     if display_text:
                                         console.print(Panel(Markdown(display_text), title="[bold green]999-CLI[/bold green]", border_style="green"))

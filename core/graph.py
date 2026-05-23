@@ -133,11 +133,24 @@ def _has_tool_calls(text: str) -> bool:
 
 
 def _get_display_text(text: str) -> str:
-    """Surgical removal of all technical noise, leaving only the model's thoughts."""
+    """Surgical removal of all technical noise, intents, and thinking blocks."""
     if not text: return ""
     
     clean = text
-    # Remove all known tags and their closing counterparts
+    
+    # 1. Strip out intent tags like [INTENT: READ_ONLY] or [INTENT: CODE_CHANGE]
+    clean = re.sub(r'\[INTENT:\s*[A-Z_]+\]', '', clean)
+    
+    # 2. Strip out entire THINK: blocks
+    # Matches from "THINK:" to the next "RESPONSE:" or "PLAN:"
+    clean = re.sub(r'THINK:.*?(?=(?:RESPONSE:|PLAN:))', '', clean, flags=re.DOTALL)
+    # Also fallback to match "THINK:" to the end of the text if no RESPONSE/PLAN exists
+    clean = re.sub(r'THINK:.*$', '', clean, flags=re.DOTALL)
+    
+    # 3. Strip out the "RESPONSE:" or "PLAN:" headers themselves
+    clean = clean.replace("RESPONSE:", "").replace("PLAN:", "")
+    
+    # 4. Remove all technical tags
     noise = [
         "<|thought|>", "</|thought|>", "<|thought>", "</|thought>",
         "<|channel>thought", "<channel|>",
@@ -147,10 +160,9 @@ def _get_display_text(text: str) -> str:
     ]
     for n in noise:
         clean = clean.replace(n, "")
-    
+        
     # Remove any residual JSON blocks
     clean = re.sub(r'\{[^{}]*"tool"[^{}]*\}', '', clean, flags=re.DOTALL)
-    # Remove any hanging closing tags from malformed output
     clean = re.sub(r'</?[a-z_]+_call/?>', '', clean)
     
     return clean.strip()
@@ -162,6 +174,9 @@ def _get_display_text(text: str) -> str:
 
 def analyze_node(state: AgentState):
     """Gathers context before planning. Loads project config if available."""
+    # Increment loop counter to prevent infinite graph cycling
+    loop_count = state.get("_loop_count", 0) + 1
+    
     # Only refresh the map if we just performed a write/delete operation
     last_verification = state.get("verification_result", "")
     should_refresh = any(phrase in last_verification for phrase in ["Successfully wrote", "Successfully patched", "Successfully deleted", "Successfully moved"])
@@ -212,6 +227,72 @@ def analyze_node(state: AgentState):
                 memory_parts.append(f"Request: {ep['request']}\nSolution:\n{ep['solution']}")
             analysis_parts.append("\n".join(memory_parts))
 
+    # --- Librarian Agent: Grounded Code-KG Context ---
+    from rich.console import Console
+    from rich.panel import Panel
+    c = Console()
+    c.print(Panel("[bold cyan]📚 LIBRARIAN AGENT[/bold cyan]\n[green]✓ Querying Codebase Knowledge Graph... Loaded structural facts and CALLS relations.[/green]", border_style="cyan"))
+
+    kg_context = ""
+    if user_query:
+        try:
+            from tools.knowledge_graph import CodeKnowledgeGraph
+            kg = CodeKnowledgeGraph()
+            kg_path = os.path.join(workspace_path, ".999", "knowledge_graph.json")
+            if kg.load_from_disk(kg_path):
+                # Search for matching nodes
+                matched_nodes = []
+                import re
+                tokens = re.findall(r'[a-zA-Z0-9_\-\.]+', user_query.lower())
+                
+                for node_id, node_data in kg.nodes.items():
+                    name = node_data.get("properties", {}).get("name", "").lower()
+                    path = node_data.get("properties", {}).get("path", "").lower()
+                    
+                    matched = False
+                    for token in tokens:
+                        if len(token) < 3:
+                            continue
+                        if token == name or token in path or token in node_id.lower():
+                            matched = True
+                            break
+                    if matched:
+                        matched_nodes.append((node_id, node_data))
+                        
+                if matched_nodes:
+                    lines = ["\n[📚 LIBRARIAN AGENT: GROUNDED STRUCTURAL FACTS]"]
+                    for node_id, node_data in matched_nodes[:5]:
+                        n_type = node_data["type"]
+                        props = node_data.get("properties", {})
+                        n_name = props.get("name", node_id)
+                        n_path = props.get("path", "")
+                        lines.append(f"- Symbol: {n_name} ({n_type.upper()}) defined in {n_path or 'unknown'}")
+                        
+                        out = []
+                        for edge_type, targets in node_data.get("edges", {}).items():
+                            for t in targets:
+                                t_name = kg.nodes.get(t, {}).get("properties", {}).get("name", t)
+                                out.append(f"{edge_type} -> {t_name}")
+                        if out:
+                            lines.append(f"  Outgoing: {', '.join(out[:5])}")
+                            
+                        inc = []
+                        for s_id, s_data in kg.nodes.items():
+                            for edge_type, targets in s_data.get("edges", {}).items():
+                                if node_id in targets:
+                                    s_name = s_data.get("properties", {}).get("name", s_id)
+                                    inc.append(f"{s_name} -> {edge_type}")
+                                    break
+                        if inc:
+                            lines.append(f"  Incoming: {', '.join(inc[:5])}")
+                            
+                    kg_context = "\n".join(lines)
+        except Exception:
+            pass
+
+    if kg_context:
+        analysis_parts.append(kg_context)
+
     # Dynamic Model Routing (Phase 4)
     complex_keywords = ["create", "implement", "refactor", "debug", "fix", "write", "patch"]
     is_complex = any(kw in user_query.lower() for kw in complex_keywords) if user_query else False
@@ -241,7 +322,8 @@ def analyze_node(state: AgentState):
 
     return {
         "analysis_result": "\n\n".join(analysis_parts),
-        "model_name": chosen_model
+        "model_name": chosen_model,
+        "_loop_count": loop_count
     }
 
 
@@ -265,14 +347,71 @@ def plan_node(state: AgentState):
     Calls the LLM to generate a plan / response.
     Delegates to agents/architect.py.
     """
+    from rich.console import Console
+    from rich.panel import Panel
+    c = Console()
+    c.print(Panel("[bold magenta]📐 ARCHITECT AGENT[/bold magenta]\n[yellow]Formulating grounded technical implementation plan...[/yellow]", border_style="magenta"))
     return execute_plan(state, client, workspace_path)
 
 def develop_node(state: AgentState):
     """
-    Calls the Developer LLM to execute coding tasks.
-    Delegates to agents/developer.py.
+    Orchestrates the Parallel Swarm: runs the Core Developer, Test Engineer, 
+    and Performance Optimizer concurrently in parallel threads using ThreadPoolExecutor.
+    Skips entirely for READ_ONLY tasks to avoid wasting LLM calls.
     """
-    return execute_develop(state, client, workspace_path)
+    # Bug 5 fix: Skip development for read-only questions
+    intent = state.get("intent", "CODE_CHANGE")
+    if intent == "READ_ONLY":
+        from rich.console import Console
+        Console().print("[dim]Developer: Skipping — read-only task.[/dim]")
+        return {
+            "internal_monologue": state.get("internal_monologue", ""),
+            "messages": []
+        }
+    
+    import concurrent.futures
+    from rich.console import Console
+    from rich.panel import Panel
+    from agents.specialists import execute_test_generation, execute_perf_optimization
+    c = Console()
+    
+    c.print(Panel(
+        "[bold green]🌀 CONCURRENT AGENT SWARM DEPLOYED[/bold green]\n"
+        "• [cyan]Developer Agent[/cyan]: Implementing core functionality concurrently\n"
+        "• [magenta]Test Engineer Agent[/magenta]: Writing test assertions concurrently\n"
+        "• [yellow]Performance Optimizer[/yellow]: Auditing speed/complexity concurrently",
+        title="[bold green]Parallel Swarm[/bold green]", border_style="green"
+    ))
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        future_dev = executor.submit(execute_develop, state, client, workspace_path)
+        future_test = executor.submit(execute_test_generation, state, client, workspace_path)
+        future_opt = executor.submit(execute_perf_optimization, state, client, workspace_path)
+        
+        dev_res = future_dev.result()
+        test_res = future_test.result()
+        opt_res = future_opt.result()
+        
+    combined_messages = []
+    if dev_res and "messages" in dev_res:
+        combined_messages.extend(dev_res["messages"])
+    if test_res and "messages" in test_res:
+        combined_messages.extend(test_res["messages"])
+    if opt_res and "messages" in opt_res:
+        combined_messages.extend(opt_res["messages"])
+        
+    monologue = (
+        f"### CORE DEVELOPER OUTPUT:\n{dev_res.get('internal_monologue', '')}\n\n"
+        f"### TEST ENGINEER OUTPUT:\n{test_res.get('internal_monologue', '')}\n\n"
+        f"### PERFORMANCE OPTIMIZER OUTPUT:\n{opt_res.get('internal_monologue', '')}"
+    )
+    
+    c.print("[green]✓ Parallel Swarm completed! Synchronized all agent outputs.[/green]")
+    
+    return {
+        "internal_monologue": monologue,
+        "messages": combined_messages
+    }
 
 def safety_gate_node(state: AgentState):
     """
@@ -511,6 +650,34 @@ def _dispatch_tool(tool_data: dict, tool_name: str, state: AgentState) -> str:
             return rag_engine.semantic_search(tool_data.get("query", ""), tool_data.get("top_k", 10))
         elif tool_name == "get_codebase_summary":
             return analyzer.get_codebase_summary()
+        elif tool_name == "trace_symbol":
+            try:
+                from tools.knowledge_graph import CodeKnowledgeGraph
+                kg = CodeKnowledgeGraph()
+                kg_path = os.path.join(workspace_path, ".999", "knowledge_graph.json")
+                if kg.load_from_disk(kg_path):
+                    return kg.trace_symbol(tool_data.get("symbol", ""))
+                else:
+                    return "Error: Could not load Knowledge Graph from disk. Run /graph or index first."
+            except Exception as e:
+                return f"Error tracing symbol: {str(e)}"
+        elif tool_name == "impact_analysis":
+            try:
+                from tools.knowledge_graph import CodeKnowledgeGraph
+                kg = CodeKnowledgeGraph()
+                kg_path = os.path.join(workspace_path, ".999", "knowledge_graph.json")
+                if kg.load_from_disk(kg_path):
+                    return kg.impact_analysis(tool_data.get("target", ""))
+                else:
+                    return "Error: Could not load Knowledge Graph from disk. Run /graph or index first."
+            except Exception as e:
+                return f"Error performing impact analysis: {str(e)}"
+        elif tool_name == "run_security_scan":
+            return analyzer.run_security_scan(tool_data.get("path", "."))
+        elif tool_name == "run_unit_tests":
+            return analyzer.run_unit_tests(tool_data.get("test_path", "tests"))
+        elif tool_name == "profile_performance":
+            return analyzer.profile_performance(tool_data.get("command", ""))
         elif tool_name == "extract_symbols":
             return analyzer.extract_symbols(tool_data.get("path", ""))
         elif tool_name == "dependency_graph":
@@ -533,6 +700,8 @@ def _dispatch_tool(tool_data: dict, tool_name: str, state: AgentState) -> str:
             return artifact_manager.list_artifacts()
         elif tool_name == "delegate_task":
             return subagent_manager.delegate(tool_data.get("task", ""), tool_data.get("context", ""))
+        elif tool_name == "delegate_parallel":
+            return subagent_manager.delegate_parallel(tool_data.get("tasks", []))
         elif tool_name == "browse_url":
             return web_tools.browse_url(tool_data.get("url"))
         elif tool_name == "fetch_url":
@@ -579,6 +748,10 @@ def verify_node(state: AgentState):
     Post-execution verification.
     Delegates to agents/reviewer.py.
     """
+    from rich.console import Console
+    from rich.panel import Panel
+    c = Console()
+    c.print(Panel("[bold yellow]🔬 QA & AUDITOR AGENT[/bold yellow]\n[yellow]Running compilations, verifying changes, and auditing risk controls...[/yellow]", border_style="yellow"))
     return execute_verify(state, client, web_tools, terminal, workspace_path, episode_store)
 
 
@@ -586,13 +759,16 @@ def verify_node(state: AgentState):
 #  ROUTING LOGIC
 # ============================================================
 
-def route_after_plan(state: AgentState) -> Literal["develop", "verify", "end"]:
+def route_after_plan(state: AgentState) -> Literal["develop", "end"]:
+    """Routes after the Architect plan node. Skips developer for read-only tasks."""
     intent = state.get("intent", "CODE_CHANGE")
+    
     if intent == "READ_ONLY":
         from rich.console import Console
         c = Console()
-        c.print("[bold cyan]Router:[/bold cyan] Read-only task detected. Skipping Developer and finishing.")
+        c.print("[bold cyan]Router:[/bold cyan] Read-only task detected. Delivering answer directly.")
         return "end"
+        
     return "develop"
 
 def route_safety(state: AgentState) -> Literal["execute", "blocked"]:
@@ -603,39 +779,41 @@ def route_safety(state: AgentState) -> Literal["execute", "blocked"]:
 
 
 def should_continue(state: AgentState) -> Literal["analyze", "end"]:
+    """
+    Post-verification routing. Decides whether to loop back for another iteration
+    or end the graph execution. Uses a hard loop cap to prevent infinite cycling.
+    """
+    from rich.console import Console
+    c = Console()
+    
     monologue = state.get("internal_monologue", "")
     score = state.get("success_score", 1.0)
     intent = state.get("intent", "CODE_CHANGE")
+    loop_count = state.get("_loop_count", 0)
     
-    if intent == "READ_ONLY" and not state.get("verification_result"):
-        from rich.console import Console
-        c = Console()
-        c.print("[bold cyan]Router:[/bold cyan] Read-only task with no execution results. Ending loop.")
+    # Hard cap: prevent infinite loops (max 3 iterations)
+    if loop_count >= 3:
+        c.print("[yellow]Router: Loop limit reached (3 iterations). Ending to prevent infinite cycling.[/yellow]")
         return "end"
-
-    if score < 0.5:
-        from rich.console import Console
-        c = Console()
-        c.print("[yellow]Auto-Correction: Success score low (< 0.5). Routing back to analyze...[/yellow]")
-        return "analyze"
-
-    # Did we just run actual tools to get data?
-    last_result = state.get("verification_result", "")
-    just_ran_tools = bool(last_result and "No tools were needed" not in last_result)
-
-    # For read-only tasks, loop back to analyze to generate the final answer ONLY IF we just got real tool results
-    if intent == "READ_ONLY" and just_ran_tools:
-        from rich.console import Console
-        c = Console()
-        c.print("[bold cyan]Router:[/bold cyan] Read-only task with tool results. Routing back to analyze for final answer.")
-        return "analyze"
-
+    
+    # READ_ONLY tasks should never loop through develop/verify — end immediately
+    if intent == "READ_ONLY":
+        c.print("[bold cyan]Router:[/bold cyan] Read-only task completed. Ending.")
+        return "end"
+    
+    # If the Architect/Developer declared FINISHED, we're done
     if state.get("finished") or "FINISHED" in monologue:
+        c.print("[bold cyan]Router:[/bold cyan] Task marked FINISHED. Ending.")
         return "end"
-
-    # Default to looping back so the agent can chain actions until it explicitly declares FINISHED
-    from rich.console import Console
-    Console().print("[bold cyan]Router:[/bold cyan] Task not marked FINISHED. Routing back to analyze for next step.")
+    
+    # If verification score is low (< 0.5), loop back to retry
+    if score < 0.5:
+        c.print(f"[yellow]Auto-Correction: Success score low ({score}). Routing back to analyze...[/yellow]")
+        return "analyze"
+    
+    # Default: Loop back to analyze so the Architect can read the execution results,
+    # generate the final conversational response, and cleanly declare FINISHED.
+    c.print("[bold cyan]Router:[/bold cyan] Tool execution complete. Routing back to analyze for final answer synthesis...")
     return "analyze"
 
 
@@ -654,7 +832,17 @@ workflow.add_node("verify", verify_node)
 
 workflow.set_entry_point("analyze")
 workflow.add_edge("analyze", "plan")
-workflow.add_edge("plan", "develop")
+
+# Bug 1 fix: Use conditional routing instead of hard edge so READ_ONLY tasks skip development
+workflow.add_conditional_edges(
+    "plan",
+    route_after_plan,
+    {
+        "develop": "develop",
+        "end": END
+    }
+)
+
 workflow.add_edge("develop", "safety_gate")
 
 workflow.add_conditional_edges(
